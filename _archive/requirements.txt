@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+parse-torrent-title
+rapidfuzz
+httpx
+pycountry
+tvdb_v4_official
+asyncpg

@@ -1,0 +1,13 @@
+# Ignora le cartelle di codice vecchio e di sviluppo
+_archive/
+_test/
+
+# Ignora i dati di runtime. I dati (log, db) devono essere gestiti 
+# con i Volumi Docker, non cotti dentro l'immagine.
+data/
+
+# File di sistema e cache di Python
+.git/
+__pycache__/
+*.pyc
+.DS_Store

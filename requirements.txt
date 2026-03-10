@@ -1,0 +1,9 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.7.0
+httpx[http2]>=0.27.0
+asyncpg>=0.29.0
+loguru>=0.7.2
+sse-starlette>=3.3.2
+gunicorn>=21.2.0 
+supervisor>=4.2.5

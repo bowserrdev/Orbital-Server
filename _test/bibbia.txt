@@ -1,0 +1,202 @@
+# ORBITAL SERVER — MASTER ARCHITECTURE (v3)
+
+---
+
+## 1. Obiettivo del Sistema
+
+Un **Backend For Frontend (BFF) stateless** ad alte prestazioni, progettato per servire l'Addon Kodi "Orbital".
+
+Risolve intenti di ricerca (scraping di metadati e torrent via Debrid Media Manager), valuta i risultati tramite logiche utente dinamiche, e restituisce i dati in tempo reale usando **Server-Sent Events (SSE)**.
+
+---
+
+## 2. Stack Tecnologico
+
+### Linguaggi
+- **Python 3.12** — Routing HTTP, orchestrazione I/O asincrono, logica applicativa.
+- **Rust (via PyO3/Maturin)** — Parsing PTN sui filename dei torrent (operazione CPU-bound su potenzialmente migliaia di file per titoli con molte stagioni). Da integrare solo dopo profiling che ne confermi la necessità, ma l'architettura lo prevede fin da subito.
+
+### Web Layer
+- **FastAPI + Uvicorn** con `uvloop` (event loop) e `httptools` (parsing HTTP).
+- **4 worker HTTP** (uno per OCPU), dedicati esclusivamente a ricevere richieste e mantenere connessioni SSE. Nessun worker HTTP esegue scraping.
+
+### Processo Scheduler (5° processo dedicato)
+- Un processo Python separato, non HTTP, che gestisce esclusivamente la coda `jobs_active`.
+- Non compete con i worker HTTP per le risorse dell'event loop.
+- È l'unico processo che scrive sullo stato DRR in `scheduler_state`.
+
+### Database
+- **PostgreSQL 18** — Unica fonte di verità per dati, coda job, stato scheduler e deduplicazione.
+- Driver: `asyncpg`.
+- Nessun Redis, nessun broker esterno. La garanzia ACID di Postgres elimina il problema del Dual Write.
+
+### Client HTTP
+- **httpx** con HTTP/2 e connection pooling tramite un Singleton `APIFactory`.
+- Le chiamate verso DMM vengono parallelizzate tramite **Cloudflare Workers** per aggirare i rate limit (429) dei siti sorgente.
+
+### Real-Time
+- **Server-Sent Events** (`sse-starlette`) — Elimina il polling lato client.
+- Notifiche inter-processo tramite **`pg_notify` / `LISTEN`** di Postgres — unico meccanismo di segnalazione tra Scheduler/Worker e i processi HTTP. `asyncio.Queue` non è utilizzato per le notifiche tra processi (non attraversa i confini di processo).
+
+### Logging
+- `loguru` — Asincrono, con rotazione automatica.
+
+---
+
+## 3. Architettura dei Dati (PostgreSQL 18)
+
+### 3.1 Dati Persistenti
+
+**`torrents`**
+Risultati dello scraping. Colonne generate (`STORED`) per score composti, indici B-Tree per query di scoring direttamente in SQL.
+
+**`media_metadata`** e **`series_blueprint`**
+Cache delle risposte TMDB e TVDB.
+
+---
+
+### 3.2 Coda dei Lavori — `jobs_active`
+
+Tabella **piccola e ad alta rotazione**. Un job entra, viene acquisito con `FOR UPDATE SKIP LOCKED`, processato, e immediatamente eliminato con `DELETE`.
+
+> **Nota sul table bloat:** il pattern `DELETE` immediato è corretto e preferibile all'`UPDATE status = 'completed'`. Con `DELETE`, autovacuum lavora su una tabella sempre piccola. I job completati vengono loggati su una tabella separata `jobs_history` con `INSERT` batch periodico, mai con `UPDATE` sulla tabella attiva.
+
+Campi chiave:
+
+| Campo | Tipo | Note |
+|---|---|---|
+| `id` | UUID | PK |
+| `imdb_id` | TEXT | Identificatore del media |
+| `media_type` | ENUM | `movie` / `series` |
+| `priority` | INT | Posizione nell'ordine del batch originale |
+| `created_at` | TIMESTAMPTZ | Per deadlock detection |
+
+---
+
+### 3.3 Deduplicazione — `job_subscriptions`
+
+Se N utenti richiedono lo stesso `imdb_id`, esiste **una sola riga** in `jobs_active` e **N righe** in `job_subscriptions`.
+
+Quando il job è completato, lo Scheduler interroga `job_subscriptions` per sapere a chi inviare il `NOTIFY`.
+
+| Campo | Tipo | Note |
+|---|---|---|
+| `job_id` | UUID | FK → `jobs_active.id` |
+| `user_id` | UUID | FK → utente |
+| `channel` | TEXT | Nome canale `pg_notify` per quell'utente |
+
+---
+
+### 3.4 Stato dello Scheduler — `scheduler_state`
+
+Mantiene il contatore di deficit DRR per ogni utente attivo. Deve persistere tra i cicli dello Scheduler e sopravvivere ai restart.
+
+| Campo | Tipo | Note |
+|---|---|---|
+| `user_id` | UUID | PK |
+| `deficit` | INT | Credito residuo corrente |
+| `updated_at` | TIMESTAMPTZ | Per cleanup utenti inattivi |
+
+> L'aggiornamento del deficit avviene **atomicamente** nella stessa transazione in cui il job viene estratto da `jobs_active`, usando `SELECT ... FOR UPDATE` su `scheduler_state`. Nessuna race condition è possibile perché il processo Scheduler è uno solo.
+
+---
+
+## 4. Algoritmo di Fairness — Deficit Round Robin (DRR)
+
+Ogni utente ha un deficit in `scheduler_state`. Ad ogni ciclo:
+
+1. Lo Scheduler legge tutti gli utenti con job in `jobs_active`.
+2. Aggiunge un **quantum fisso** al deficit di ciascuno.
+3. Estrae il job dell'utente con deficit maggiore (a parità, vince la `priority` più alta).
+4. Decrementa il deficit dell'utente del costo del job (costo base: 1 per film, variabile per serie TV con molte stagioni).
+5. Porta il deficit residuo al ciclo successivo.
+
+Questo garantisce **max-min fairness**: se un utente ha 2 item e un altro ne ha 98, il primo finisce prima e le risorse vengono ridistribuite automaticamente, senza sprechi.
+
+---
+
+## 5. Flusso Logico — Ciclo di Vita di una Richiesta
+
+### FASE 1 — Ingresso (`POST /discover` + apertura SSE)
+
+1. Kodi invia un JSON con N `imdb_id` e il profilo utente, aprendo una connessione SSE persistente.
+2. FastAPI esegue una query batch su `torrents` per tutti gli N elementi.
+3. **Cache hit**: i risultati già presenti vengono inviati immediatamente tramite SSE.
+4. **Cache miss o dati vecchi**: per ogni elemento mancante, in **un'unica transazione atomica**:
+   - Controlla se esiste già un job in `jobs_active` per quell'`imdb_id` (deduplicazione).
+   - Se non esiste: `INSERT` in `jobs_active` con la priorità calcolata dalla posizione nel batch.
+   - In ogni caso: `INSERT` in `job_subscriptions` legando l'utente al job.
+5. Il worker HTTP rimane in ascolto su un canale `LISTEN` Postgres dedicato a quell'utente. Non consuma CPU attiva (attesa asincrona).
+
+---
+
+### FASE 2 — Scheduling (Processo Scheduler, loop continuo)
+
+1. Lo Scheduler esegue la "Super Query":
+   - `SELECT` da `jobs_active` con `FOR UPDATE SKIP LOCKED`.
+   - `JOIN` con `scheduler_state` per leggere i deficit.
+   - Ordinamento per deficit decrescente, poi per priority.
+   - `UPDATE` atomico del deficit nella stessa transazione.
+2. Distribuisce il job al pool di Worker asincroni interni.
+
+---
+
+### FASE 3 — Esecuzione (Worker asincroni nel processo Scheduler)
+
+1. Il Worker riceve il job.
+2. Chiama `APIFactory` per le richieste parallele verso TMDB, TVDB e DMM (via Cloudflare Workers).
+3. Riceve i risultati grezzi: lista di torrent con filename (potenzialmente migliaia per serie TV).
+4. **Parsing PTN**: i filename vengono passati al modulo Rust tramite PyO3 per il parsing e il pre-scoring. Operazione CPU-bound, eseguita fuori dall'event loop tramite `asyncio.run_in_executor`.
+5. `INSERT` (o `COPY`) massivo su `torrents` con i risultati processati.
+
+---
+
+### FASE 4 — Notifica e Risposta SSE
+
+1. Il Worker esegue `DELETE` da `jobs_active`.
+2. Interroga `job_subscriptions` per recuperare gli utenti in attesa.
+3. Per ogni utente: `pg_notify(channel, job_id)`.
+4. Il worker HTTP del processo Uvicorn corrispondente riceve il `NOTIFY` tramite `asyncio.Queue` locale (che riceve dall'`asyncpg` connection in ascolto).
+5. Estrae i dati calcolati da `torrents`, li formatta e li invia nel canale SSE verso Kodi.
+6. Kodi riceve il pacchetto e renderizza l'elemento, mentre il server continua sugli item rimanenti.
+
+---
+
+## 6. Topologia dei Processi
+
+```
+┌─────────────────────────────────────────────────┐
+│                   Docker Container               │
+│                                                 │
+│  Worker HTTP 1  ──┐                             │
+│  Worker HTTP 2  ──┤── LISTEN (asyncpg) ──┐      │
+│  Worker HTTP 3  ──┤                      │      │
+│  Worker HTTP 4  ──┘                      │      │
+│                                          │      │
+│  Processo Scheduler ── NOTIFY ───────────┘      │
+│       │                                         │
+│       └── asyncpg pool ──────── PostgreSQL 18   │
+└─────────────────────────────────────────────────┘
+```
+
+- **4 processi HTTP**: solo I/O di rete verso i client, LISTEN passivo.
+- **1 processo Scheduler**: solo gestione coda, NOTIFY, orchestrazione worker interni.
+- **PostgreSQL 18**: unica fonte di verità, unico bus di comunicazione inter-processo.
+
+---
+
+## 7. Considerazioni Operative
+
+### Deadlock e Job Orfani
+I job in `jobs_active` con `created_at` più vecchio di N minuti e nessun lock attivo vengono reimmessi in coda da un cronjob periodico dello Scheduler (worker crash recovery).
+
+### Cleanup
+- `jobs_history`: popolato con batch insert periodico (es. ogni ora) a partire dai log di completamento. Mai con UPDATE su `jobs_active`.
+- `scheduler_state`: righe di utenti inattivi da più di X ore vengono eliminate per evitare accumulo.
+
+### Rust — Quando integrarlo
+Integrare Rust per il parsing PTN **fin dall'inizio** se i titoli target hanno regolarmente serie TV con molte stagioni (decine di migliaia di filename per job). Usare `asyncio.run_in_executor` con un `ProcessPoolExecutor` dedicato per non bloccare l'event loop dello Scheduler.
+
+---
+
+*Documento di riferimento architetturale — ogni deviazione implementativa va motivata esplicitamente.*
