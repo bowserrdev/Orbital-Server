@@ -7,4 +7,3 @@ loguru>=0.7.2
 sse-starlette>=3.3.2
 gunicorn>=21.2.0 
 supervisor>=4.2.5
-prova
